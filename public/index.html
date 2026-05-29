@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>六角島オンライン</title>
+  <script src="/socket.io/socket.io.js"></script>
+  <style>
+    *{box-sizing:border-box} body{margin:0;min-height:100vh;font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#eef6ff;color:#0f172a}.app{width:min(1180px,100%);margin:auto;padding:16px}.hero,.panel{background:#fff;border-radius:24px;box-shadow:0 10px 30px rgba(15,23,42,.1);padding:20px}.hero{margin:24px auto;max-width:720px;text-align:center}h1{margin:0;font-size:clamp(28px,5vw,48px)}p{line-height:1.7}.mode-buttons{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:16px}.hidden{display:none!important}button,input,select{font:inherit}button{border:0;border-radius:16px;padding:12px 16px;background:#0f172a;color:#fff;font-weight:900;cursor:pointer}button.secondary{background:#e2e8f0;color:#0f172a}button.danger{background:#e11d48}button:disabled{opacity:.4;cursor:not-allowed}input,select{width:100%;border:2px solid #dbe4ef;border-radius:14px;padding:12px;background:#fff}.form{display:grid;gap:12px;margin-top:16px;text-align:left}.layout{display:grid;grid-template-columns:1fr 340px;gap:16px}.topbar{display:flex;justify-content:space-between;gap:12px;align-items:center;margin-bottom:16px}.room-badge{background:#0f172a;color:white;padding:8px 12px;border-radius:999px;font-weight:900}.board-wrap{overflow:auto;text-align:center}.board-svg{width:100%;max-width:760px;min-width:520px}.tile{stroke:#334155;stroke-width:2;cursor:pointer;transition:.15s}.tile:hover{filter:brightness(1.05)}.tile.selected{stroke:#facc15;stroke-width:6}.tile.desert{fill:#d6b98c}.tile.wood{fill:#86efac}.tile.brick{fill:#fb7185}.tile.wheat{fill:#fde68a}.tile.sheep{fill:#bbf7d0}.tile.ore{fill:#cbd5e1}.number{font-weight:900;font-size:18px;pointer-events:none}.res-label{font-weight:800;font-size:14px;pointer-events:none}.building{stroke:#fff;stroke-width:3;pointer-events:none}.city{stroke-width:5}.road{stroke-linecap:round;stroke-width:8}.score-list,.resources,.log{display:grid;gap:8px}.player-card{border-radius:16px;padding:12px;border:2px solid transparent}.player-card.active{border-color:#facc15;box-shadow:0 0 0 4px rgba(250,204,21,.25)}.player-top{display:flex;justify-content:space-between;align-items:center;gap:8px;font-weight:900}.dot{width:14px;height:14px;border-radius:50%;display:inline-block}.res-grid{display:grid;grid-template-columns:repeat(5,1fr);gap:6px}.res{border-radius:12px;background:#f1f5f9;padding:8px;text-align:center;font-size:13px;font-weight:800}.actions{display:grid;gap:8px}.msg{margin-top:12px;padding:12px;background:#f8fafc;border-radius:14px;color:#334155}.log-item{font-size:13px;background:#f8fafc;border-radius:12px;padding:8px;line-height:1.5}.costs{font-size:13px;color:#475569;line-height:1.7}.winner{font-size:26px;font-weight:1000;color:#e11d48;text-align:center;padding:18px;border-radius:18px;background:#fff1f2;margin-bottom:12px}.trade-row{display:grid;grid-template-columns:1fr 1fr auto;gap:8px}.small{font-size:13px;color:#64748b}@media(max-width:900px){.layout{grid-template-columns:1fr}.mode-buttons{grid-template-columns:1fr}.topbar{flex-direction:column;align-items:stretch}}
+  </style>
+</head>
+<body>
+  <div class="app">
+    <section id="startScreen" class="hero">
+      <h1>六角島オンライン</h1>
+      <p>資源を集めて、道・拠点・都市を作るオンライン開拓ボードゲームのプロトタイプです。</p>
+      <div id="modeSelect" class="mode-buttons">
+        <button id="showCreate">部屋を作る</button>
+        <button class="secondary" id="showJoin">入室する</button>
+      </div>
+      <div id="createForm" class="form hidden">
+        <label>あなたの名前<input id="createName" maxlength="16" placeholder="例：たろう"></label>
+        <label>人数<select id="maxPlayers"><option value="2">2人</option><option value="3">3人</option><option value="4">4人</option></select></label>
+        <button id="createRoom">部屋を作る</button><button class="secondary back">戻る</button>
+      </div>
+      <div id="joinForm" class="form hidden">
+        <label>あなたの名前<input id="joinName" maxlength="16" placeholder="例：はなこ"></label>
+        <label>部屋ID<input id="joinRoomId" maxlength="4" placeholder="ABCD"></label>
+        <button id="joinRoom">入室する</button><button class="secondary back">戻る</button>
+      </div>
+      <div id="resumeBox" class="form hidden"><button id="resumeBtn">前回の部屋に再接続</button><button class="secondary" id="clearResume">再接続情報を消す</button></div>
+      <div id="startMessage" class="msg hidden"></div>
+    </section>
+
+    <section id="gameScreen" class="hidden">
+      <div class="topbar">
+        <div><h1>六角島オンライン</h1><div class="small">公式ゲームの素材や名称を使わない独自プロトタイプです。</div></div>
+        <div class="room-badge">部屋ID：<span id="roomIdLabel"></span></div>
+      </div>
+      <div id="winnerBox" class="winner hidden"></div>
+      <div class="layout">
+        <main class="panel">
+          <div class="board-wrap"><svg id="board" class="board-svg" viewBox="0 0 760 650"></svg></div>
+          <div class="msg" id="hint">土地を選ぶと、拠点・都市・道の操作ができます。</div>
+        </main>
+        <aside class="side">
+          <section class="panel">
+            <h2>操作</h2>
+            <div class="actions">
+              <button id="startGame">ゲーム開始</button>
+              <button id="rollDice">サイコロを振る</button>
+              <button id="buildSettlement">選択地に拠点</button>
+              <button id="upgradeCity">選択地を都市化</button>
+              <button id="buildRoad">選択地から道</button>
+              <button id="endTurn" class="secondary">ターン終了</button>
+            </div>
+            <div class="msg">サイコロ：<b id="diceLabel">まだ</b></div>
+            <div class="costs">拠点：木1 土1 麦1 羊1<br>都市：麦2 石3<br>道：木1 土1</div>
+          </section>
+          <section class="panel"><h2>プレイヤー</h2><div id="players" class="score-list"></div></section>
+          <section class="panel"><h2>自分の資源</h2><div id="myResources" class="res-grid"></div><div class="trade-row" style="margin-top:10px"><select id="giveRes"></select><select id="receiveRes"></select><button id="bankTrade">4:1交換</button></div></section>
+          <section class="panel"><h2>ログ</h2><div id="log" class="log"></div></section>
+        </aside>
+      </div>
+    </section>
+  </div>
+<script>
+const socket=io();
+let room=null, token=localStorage.getItem('hex_token'), savedRoom=localStorage.getItem('hex_room'), myPlayerId=Number(localStorage.getItem('hex_player')||0), selectedTile=null;
+const labels={wood:'木',brick:'土',wheat:'麦',sheep:'羊',ore:'石',desert:'砂漠'};
+const resList=['wood','brick','wheat','sheep','ore'];
+const $=id=>document.getElementById(id);
+function showStartMsg(t){$('startMessage').textContent=t;$('startMessage').classList.remove('hidden')}
+function saveSession(roomId,tok,pid){localStorage.setItem('hex_room',roomId);localStorage.setItem('hex_token',tok);localStorage.setItem('hex_player',pid);token=tok;savedRoom=roomId;myPlayerId=pid}
+function showGame(){ $('startScreen').classList.add('hidden'); $('gameScreen').classList.remove('hidden') }
+function showMode(mode){$('modeSelect').classList.toggle('hidden',mode);$('createForm').classList.toggle('hidden',mode!=='create');$('joinForm').classList.toggle('hidden',mode!=='join');}
+$('showCreate').onclick=()=>showMode('create'); $('showJoin').onclick=()=>showMode('join'); document.querySelectorAll('.back').forEach(b=>b.onclick=()=>showMode(null));
+if(savedRoom&&token) $('resumeBox').classList.remove('hidden');
+$('clearResume').onclick=()=>{localStorage.removeItem('hex_room');localStorage.removeItem('hex_token');localStorage.removeItem('hex_player');$('resumeBox').classList.add('hidden')};
+$('resumeBtn').onclick=()=>socket.emit('reconnectPlayer',{roomId:savedRoom,token},res=>{if(!res.ok)return showStartMsg(res.message);saveSession(res.roomId,res.token,res.playerId);room=res.room;showGame();render();});
+$('createRoom').onclick=()=>socket.emit('createRoom',{name:$('createName').value,maxPlayers:$('maxPlayers').value},res=>{if(!res.ok)return showStartMsg(res.message);saveSession(res.roomId,res.token,res.playerId);room=res.room;showGame();render();});
+$('joinRoom').onclick=()=>socket.emit('joinRoom',{roomId:$('joinRoomId').value.toUpperCase(),name:$('joinName').value},res=>{if(!res.ok)return showStartMsg(res.message);saveSession(res.roomId,res.token,res.playerId);room=res.room;showGame();render();});
+socket.on('roomState',state=>{room=state;render();});
+function api(name,data={}){socket.emit(name,{...data,roomId:room.id,token},res=>{if(res&&!res.ok) $('hint').textContent=res.message;});}
+$('startGame').onclick=()=>api('startGame'); $('rollDice').onclick=()=>api('rollDice'); $('buildSettlement').onclick=()=>selectedTile?api('buildSettlement',{tileId:selectedTile}):$('hint').textContent='土地を選んでください。'; $('upgradeCity').onclick=()=>selectedTile?api('upgradeCity',{tileId:selectedTile}):$('hint').textContent='土地を選んでください。'; $('buildRoad').onclick=()=>selectedTile?api('buildRoad',{edgeKey:selectedTile+'-road'}):$('hint').textContent='土地を選んでください。'; $('endTurn').onclick=()=>api('endTurn'); $('bankTrade').onclick=()=>api('bankTrade',{give:$('giveRes').value,receive:$('receiveRes').value});
+function hexPoints(cx,cy,size){let pts=[];for(let i=0;i<6;i++){const a=Math.PI/180*(60*i-30);pts.push(`${cx+size*Math.cos(a)},${cy+size*Math.sin(a)}`)}return pts.join(' ')}
+function axialToPixel(q,r){const size=62, cx=380+size*Math.sqrt(3)*(q+r/2), cy=320+size*1.5*r;return{cx,cy,size}}
+function render(){if(!room)return;showGame();$('roomIdLabel').textContent=room.id;const me=room.players.find(p=>p.id===myPlayerId);const cur=room.players[room.currentPlayerIndex];const isMyTurn=room.started&&!room.gameOver&&cur&&cur.id===myPlayerId;$('startGame').style.display=(room.hostToken===token&&!room.started)?'block':'none';$('rollDice').disabled=!isMyTurn||room.phase!=='roll';$('buildSettlement').disabled=!isMyTurn||room.phase==='roll';$('upgradeCity').disabled=!isMyTurn||room.phase==='roll';$('buildRoad').disabled=!isMyTurn||room.phase==='roll';$('endTurn').disabled=!isMyTurn||room.phase==='roll';$('diceLabel').textContent=room.dice?`${room.dice.d1}+${room.dice.d2}=${room.dice.sum}`:'まだ';$('hint').textContent=room.gameOver?'ゲーム終了です。':!room.started?'人数が揃ったら部屋主が開始します。':isMyTurn?(room.phase==='roll'?'あなたの番です。サイコロを振ってください。':'あなたの番です。建設するかターン終了してください。'):`${cur?cur.name:'誰か'} の番です。`;
+if(room.gameOver){const names=room.players.filter(p=>room.winnerIds.includes(p.id)).map(p=>p.name).join('・');$('winnerBox').textContent=`WINNER：${names}`;$('winnerBox').classList.remove('hidden')}else $('winnerBox').classList.add('hidden');
+renderBoard();renderPlayers();renderResources(me);renderLog();renderTrade();}
+function renderBoard(){const svg=$('board');svg.innerHTML='';room.board.forEach(t=>{const {cx,cy,size}=axialToPixel(t.q,t.r);const poly=document.createElementNS('http://www.w3.org/2000/svg','polygon');poly.setAttribute('points',hexPoints(cx,cy,size));poly.setAttribute('class',`tile ${t.resource} ${selectedTile===t.id?'selected':''}`);poly.onclick=()=>{selectedTile=t.id;renderBoard();};svg.appendChild(poly);const txt=document.createElementNS('http://www.w3.org/2000/svg','text');txt.setAttribute('x',cx);txt.setAttribute('y',cy-6);txt.setAttribute('text-anchor','middle');txt.setAttribute('class','res-label');txt.textContent=labels[t.resource];svg.appendChild(txt);const num=document.createElementNS('http://www.w3.org/2000/svg','text');num.setAttribute('x',cx);num.setAttribute('y',cy+18);num.setAttribute('text-anchor','middle');num.setAttribute('class','number');num.textContent=t.number||'';svg.appendChild(num);if(t.owner){const p=room.players.find(x=>x.id===t.owner);const c=document.createElementNS('http://www.w3.org/2000/svg','circle');c.setAttribute('cx',cx);c.setAttribute('cy',cy+42);c.setAttribute('r',t.city?18:13);c.setAttribute('fill',p.color);c.setAttribute('class',`building ${t.city?'city':''}`);svg.appendChild(c);const b=document.createElementNS('http://www.w3.org/2000/svg','text');b.setAttribute('x',cx);b.setAttribute('y',cy+47);b.setAttribute('text-anchor','middle');b.setAttribute('font-size','13');b.setAttribute('font-weight','900');b.setAttribute('fill','#fff');b.textContent=t.city?'市':'拠';svg.appendChild(b);} });room.roads.forEach((r,i)=>{const id=r.edgeKey.replace('-road','');const t=room.board.find(x=>x.id===id);if(!t)return;const p=room.players.find(x=>x.id===r.owner);const {cx,cy}=axialToPixel(t.q,t.r);const line=document.createElementNS('http://www.w3.org/2000/svg','line');line.setAttribute('x1',cx-35);line.setAttribute('y1',cy-54);line.setAttribute('x2',cx+35);line.setAttribute('y2',cy-54);line.setAttribute('stroke',p.color);line.setAttribute('class','road');svg.appendChild(line);});}
+function renderPlayers(){const curId=room.players[room.currentPlayerIndex]?.id;$('players').innerHTML=room.players.map(p=>`<div class="player-card ${p.id===curId?'active':''}" style="background:${p.light}"><div class="player-top"><span><span class="dot" style="background:${p.color}"></span> ${p.name}${p.id===myPlayerId?'（あなた）':''}</span><span>${p.victoryPoints}点</span></div><div class="small">${p.connected?'接続中':'切断中'} / 資源 ${Object.values(p.resources).reduce((a,b)=>a+b,0)}</div></div>`).join('')}
+function renderResources(me){$('myResources').innerHTML=resList.map(r=>`<div class="res">${labels[r]}<br><b>${me?me.resources[r]:0}</b></div>`).join('')}
+function renderLog(){$('log').innerHTML=(room.log||[]).slice().reverse().map(l=>`<div class="log-item">${l.text}</div>`).join('')}
+function renderTrade(){const opts=resList.map(r=>`<option value="${r}">${labels[r]}</option>`).join('');$('giveRes').innerHTML=opts;$('receiveRes').innerHTML=opts;$('receiveRes').value='wood'}
+</script>
+</body>
+</html>
