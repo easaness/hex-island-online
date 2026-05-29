@@ -1,6 +1,8 @@
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
+const fs = require('fs');
+const path = require('path');
 
 const app = express();
 const server = http.createServer(app);
@@ -16,10 +18,108 @@ const PLAYER_LIGHT = ['#dbeafe', '#ffe4e6', '#dcfce7', '#f3e8ff'];
 const COSTS = {
   settlement: { wood: 1, brick: 1, wheat: 1, sheep: 1, ore: 0 },
   city: { wood: 0, brick: 0, wheat: 2, sheep: 0, ore: 3 },
-  road: { wood: 1, brick: 1, wheat: 0, sheep: 0, ore: 0 }
+  road: { wood: 1, brick: 1, wheat: 0, sheep: 0, ore: 0 },
+  development: { wood: 0, brick: 0, wheat: 1, sheep: 1, ore: 1 }
 };
+const DEV_CARD_LABELS = { knight: '騎士', victory: '勝利点', roadBuilding: '道路建設', yearOfPlenty: '収穫', monopoly: '独占' };
 const TARGET_POINTS = 10;
 const rooms = new Map();
+const DATA_DIR = process.env.ROOM_DATA_DIR || process.env.RENDER_DISCOVERY_SERVICE || '/tmp';
+const SAVE_FILE = process.env.ROOM_SAVE_FILE || path.join(DATA_DIR === '/tmp' ? '/tmp' : '/tmp', 'hex-island-rooms.json');
+
+
+function saveRoomsToDisk() {
+  try {
+    const payload = Array.from(rooms.entries()).map(([id, room]) => [id, room]);
+    fs.writeFileSync(SAVE_FILE, JSON.stringify(payload), 'utf8');
+  } catch (error) {
+    console.warn('Room save failed:', error.message);
+  }
+}
+function loadRoomsFromDisk() {
+  try {
+    if (!fs.existsSync(SAVE_FILE)) return;
+    const payload = JSON.parse(fs.readFileSync(SAVE_FILE, 'utf8'));
+    if (!Array.isArray(payload)) return;
+    payload.forEach(([id, room]) => {
+      if (id && room && Array.isArray(room.players)) rooms.set(id, room);
+    });
+    console.log(`Restored ${rooms.size} room(s) from ${SAVE_FILE}`);
+  } catch (error) {
+    console.warn('Room restore failed:', error.message);
+  }
+}
+function clonePlain(value) {
+  return JSON.parse(JSON.stringify(value));
+}
+function restoreRoomFromSnapshot(snapshot, token, playerId) {
+  if (!snapshot || !snapshot.id || !Array.isArray(snapshot.players) || !Array.isArray(snapshot.tiles) || !Array.isArray(snapshot.nodes) || !Array.isArray(snapshot.edges)) return null;
+  const normalizedId = String(snapshot.id).trim().toUpperCase();
+  const pid = Number(playerId);
+  const players = snapshot.players.map(p => ({
+    id: Number(p.id),
+    token: Number(p.id) === pid ? token : null,
+    name: String(p.name || `プレイヤー${p.id}`).slice(0, 16),
+    color: p.color || PLAYER_COLORS[(Number(p.id) || 1) - 1] || '#334155',
+    light: p.light || PLAYER_LIGHT[(Number(p.id) || 1) - 1] || '#f1f5f9',
+    connected: Number(p.id) === pid,
+    resources: Object.assign(blankResources(0), p.resources || {}),
+    devCards: Object.assign(blankDevCards(), p.devCards || {}),
+    playedKnights: Number(p.playedKnights) || 0
+  })).filter(p => p.id >= 1 && p.id <= 4);
+  if (!players.some(p => p.id === pid)) return null;
+  const room = {
+    id: normalizedId,
+    maxPlayers: Math.max(2, Math.min(4, Number(snapshot.maxPlayers) || players.length || 2)),
+    hostToken: pid === 1 ? token : null,
+    players,
+    started: !!snapshot.started,
+    gameOver: !!snapshot.gameOver,
+    currentPlayerIndex: Number(snapshot.currentPlayerIndex) || 0,
+    phase: snapshot.phase || 'waiting',
+    setupOrder: Array.isArray(snapshot.setupOrder) ? snapshot.setupOrder : [],
+    setupIndex: Number(snapshot.setupIndex) || 0,
+    setupSubphase: snapshot.setupSubphase || 'settlement',
+    setupSettlementNode: snapshot.setupSettlementNode || null,
+    tiles: clonePlain(snapshot.tiles),
+    nodes: clonePlain(snapshot.nodes),
+    edges: clonePlain(snapshot.edges),
+    ports: clonePlain(snapshot.ports || []),
+    robberTileId: snapshot.robberTileId || (snapshot.tiles[0] && snapshot.tiles[0].id),
+    dice: snapshot.dice || null,
+    winnerIds: Array.isArray(snapshot.winnerIds) ? snapshot.winnerIds : [],
+    log: Array.isArray(snapshot.log) ? snapshot.log.slice(-80) : [],
+    longestRoadOwnerId: snapshot.longestRoadOwnerId || null,
+    longestRoadLength: Number(snapshot.longestRoadLength) || 0,
+    pendingTrade: snapshot.pendingTrade || null,
+    devDeck: Array.isArray(snapshot.devDeck) ? snapshot.devDeck : createDevDeck(),
+    largestArmyOwnerId: snapshot.largestArmyOwnerId || null,
+    largestArmySize: Number(snapshot.largestArmySize) || 0
+  };
+  roomLog(room, 'サーバー側の部屋情報が消えていたため、ブラウザの保存データから部屋を復元しました。', 'info');
+  rooms.set(normalizedId, room);
+  saveRoomsToDisk();
+  return room;
+}
+function normalizeRoomId(roomId) {
+  return String(roomId || '').trim().toUpperCase();
+}
+function ensureRoomFromPayload(payload) {
+  if (!payload || !payload.roomId) return null;
+  const roomId = normalizeRoomId(payload.roomId);
+  let room = rooms.get(roomId);
+  if (!room && payload.snapshot) {
+    room = restoreRoomFromSnapshot(payload.snapshot, payload.token, payload.playerId);
+  }
+  return room || null;
+}
+function touchRoom(room) {
+  if (!room) return;
+  room.updatedAt = Date.now();
+  saveRoomsToDisk();
+}
+setInterval(saveRoomsToDisk, 30000).unref();
+loadRoomsFromDisk();
 
 function makeRoomId() {
   const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
@@ -37,6 +137,17 @@ function shuffle(array) {
   return a;
 }
 function blankResources(amount = 0) { return { wood: amount, brick: amount, wheat: amount, sheep: amount, ore: amount }; }
+function blankDevCards() { return { knight: 0, victory: 0, roadBuilding: 0, yearOfPlenty: 0, monopoly: 0 }; }
+function createDevDeck() {
+  return shuffle([
+    ...Array(14).fill('knight'),
+    ...Array(5).fill('victory'),
+    ...Array(2).fill('roadBuilding'),
+    ...Array(2).fill('yearOfPlenty'),
+    ...Array(2).fill('monopoly')
+  ]);
+}
+function devCardCount(cards) { return Object.values(cards || {}).reduce((a, b) => a + (Number(b) || 0), 0); }
 function canAfford(player, cost) { return RESOURCES.every(res => (player.resources[res] || 0) >= (cost[res] || 0)); }
 function pay(player, cost) { RESOURCES.forEach(res => player.resources[res] -= cost[res] || 0); }
 function resourceTotal(player) { return RESOURCES.reduce((s, r) => s + (player.resources[r] || 0), 0); }
@@ -70,7 +181,8 @@ function createBoard() {
   });
   const desert = tiles.find(t => t.resource === 'desert');
   const { nodes, edges } = createGraph(tiles);
-  return { tiles, nodes, edges, robberTileId: desert ? desert.id : tiles[0].id };
+  const ports = createPorts(nodes);
+  return { tiles, nodes, edges, ports, robberTileId: desert ? desert.id : tiles[0].id };
 }
 function axialToPixel(q, r) {
   const size = 100;
@@ -120,6 +232,46 @@ function createGraph(tiles) {
   });
   return { nodes, edges };
 }
+function createPorts(nodes) {
+  const portTypes = ['wood', 'brick', 'wheat', 'sheep', 'ore', 'any', 'any', 'any', 'any'];
+  const coastal = nodes
+    .filter(n => n.adjacentTiles.length < 3)
+    .map(n => {
+      const angle = Math.atan2(n.y, n.x);
+      const distance = Math.hypot(n.x, n.y);
+      return { node: n, angle, distance };
+    })
+    .sort((a, b) => a.angle - b.angle || b.distance - a.distance);
+  if (!coastal.length) return [];
+  const step = coastal.length / portTypes.length;
+  const used = new Set();
+  return portTypes.map((type, index) => {
+    let pickIndex = Math.round(index * step) % coastal.length;
+    while (used.has(coastal[pickIndex].node.id)) pickIndex = (pickIndex + 1) % coastal.length;
+    const chosen = coastal[pickIndex].node;
+    used.add(chosen.id);
+    const len = Math.hypot(chosen.x, chosen.y) || 1;
+    return {
+      id: `p${index}`,
+      type,
+      nodeIds: [chosen.id],
+      x: chosen.x + (chosen.x / len) * 58,
+      y: chosen.y + (chosen.y / len) * 58
+    };
+  });
+}
+function playerPorts(room, playerId) {
+  return (room.ports || []).filter(port => port.nodeIds.some(nodeId => room.nodes.find(n => n.id === nodeId && n.owner === playerId)));
+}
+function bestBankRate(room, playerId, give) {
+  const ports = playerPorts(room, playerId);
+  if (ports.some(port => port.type === give)) return 2;
+  if (ports.some(port => port.type === 'any')) return 3;
+  return 4;
+}
+function portLabel(type) {
+  return type === 'any' ? '3:1港' : `${RESOURCE_ICONS[type]}${RESOURCE_LABELS[type]} 2:1港`;
+}
 function createSetupOrder(players) {
   const ids = players.map(p => p.id);
   return ids.concat(ids.slice().reverse());
@@ -166,12 +318,35 @@ function updateLongestRoad(room) {
     room.longestRoadLength = max;
   }
 }
+
+function updateLargestArmy(room) {
+  const results = room.players.map(p => ({ id: p.id, count: Number(p.playedKnights || 0) }));
+  const max = Math.max(...results.map(r => r.count), 0);
+  if (max < 3) {
+    room.largestArmySize = max;
+    return;
+  }
+  const leaders = results.filter(r => r.count === max);
+  if (leaders.length === 1) {
+    if (room.largestArmyOwnerId !== leaders[0].id) {
+      const p = room.players.find(x => x.id === leaders[0].id);
+      roomLog(room, `${p.name} が最大騎士力を獲得しました！`, 'bonus');
+    }
+    room.largestArmyOwnerId = leaders[0].id;
+    room.largestArmySize = max;
+  } else {
+    room.largestArmySize = max;
+  }
+}
 function victoryPoints(room, playerId) {
   let points = room.nodes.reduce((sum, n) => {
     if (n.owner !== playerId) return sum;
     return sum + (n.city ? 2 : 1);
   }, 0);
   if (room.longestRoadOwnerId === playerId) points += 2;
+  if (room.largestArmyOwnerId === playerId) points += 2;
+  const player = room.players.find(p => p.id === playerId);
+  if (player && player.devCards) points += Number(player.devCards.victory || 0);
   return points;
 }
 function publicRoom(room) {
@@ -181,7 +356,9 @@ function publicRoom(room) {
     hostToken: room.hostToken,
     players: room.players.map(p => ({
       id: p.id, name: p.name, color: p.color, light: p.light, connected: p.connected,
-      victoryPoints: victoryPoints(room, p.id), resources: p.resources, resourceCount: resourceTotal(p), roadLength: calculateLongestRoad(room, p.id)
+      victoryPoints: victoryPoints(room, p.id), resources: p.resources, resourceCount: resourceTotal(p), roadLength: calculateLongestRoad(room, p.id),
+      ports: playerPorts(room, p.id).map(port => ({ id: port.id, type: port.type, label: portLabel(port.type) })),
+      devCards: p.devCards || blankDevCards(), devCardCount: devCardCount(p.devCards), playedKnights: Number(p.playedKnights || 0)
     })),
     started: room.started,
     gameOver: room.gameOver,
@@ -194,20 +371,26 @@ function publicRoom(room) {
     tiles: room.tiles,
     nodes: room.nodes,
     edges: room.edges,
+    ports: room.ports || [],
     robberTileId: room.robberTileId,
     dice: room.dice,
     winnerIds: room.winnerIds,
     log: room.log.slice(-32),
     longestRoadOwnerId: room.longestRoadOwnerId,
     longestRoadLength: room.longestRoadLength,
+    largestArmyOwnerId: room.largestArmyOwnerId || null,
+    largestArmySize: room.largestArmySize || 0,
+    devDeckCount: room.devDeck ? room.devDeck.length : 0,
+    devCardLabels: DEV_CARD_LABELS,
     pendingTrade: room.pendingTrade,
     costs: COSTS,
     targetPoints: TARGET_POINTS
   };
 }
-function emitRoom(room) { io.to(room.id).emit('roomState', publicRoom(room)); }
+function emitRoom(room) { saveRoomsToDisk(); io.to(room.id).emit('roomState', publicRoom(room)); }
 function checkWin(room) {
   updateLongestRoad(room);
+  updateLargestArmy(room);
   const scores = room.players.map(p => ({ id: p.id, score: victoryPoints(room, p.id) }));
   const max = Math.max(...scores.map(s => s.score));
   if (max >= TARGET_POINTS) {
@@ -295,15 +478,35 @@ function makeRoom(name, maxPlayers) {
   const id = makeRoomId();
   const token = makeToken();
   const board = createBoard();
-  const player = { id: 1, token, name: (name || 'プレイヤー1').trim().slice(0, 16), color: PLAYER_COLORS[0], light: PLAYER_LIGHT[0], connected: true, resources: blankResources(0) };
+  const player = { id: 1, token, name: (name || 'プレイヤー1').trim().slice(0, 16), color: PLAYER_COLORS[0], light: PLAYER_LIGHT[0], connected: true, resources: blankResources(0), devCards: blankDevCards(), playedKnights: 0 };
   return {
-    room: { id, maxPlayers: Math.max(2, Math.min(4, Number(maxPlayers) || 2)), hostToken: token, players: [player], started: false, gameOver: false, currentPlayerIndex: 0, phase: 'waiting', setupOrder: [], setupIndex: 0, setupSubphase: 'settlement', setupSettlementNode: null, ...board, dice: null, winnerIds: [], log: [], longestRoadOwnerId: null, longestRoadLength: 0, pendingTrade: null },
+    room: { id, maxPlayers: Math.max(2, Math.min(4, Number(maxPlayers) || 2)), hostToken: token, players: [player], started: false, gameOver: false, currentPlayerIndex: 0, phase: 'waiting', setupOrder: [], setupIndex: 0, setupSubphase: 'settlement', setupSettlementNode: null, ...board, dice: null, winnerIds: [], log: [], longestRoadOwnerId: null, longestRoadLength: 0, pendingTrade: null, devDeck: createDevDeck(), largestArmyOwnerId: null, largestArmySize: 0 },
     token,
     player
   };
 }
 
 io.on('connection', socket => {
+  socket.use((packet, next) => {
+    try {
+      const data = packet && packet[1];
+      if (data && data.roomId && !rooms.has(normalizeRoomId(data.roomId)) && data.snapshot) {
+        restoreRoomFromSnapshot(data.snapshot, data.token, data.playerId);
+      }
+    } catch (error) {
+      console.warn('Packet recovery failed:', error.message);
+    }
+    next();
+  });
+  socket.on('clientSnapshot', ({ roomId, token, playerId, snapshot }, cb) => {
+    let room = rooms.get(normalizeRoomId(roomId));
+    if (!room && snapshot) room = restoreRoomFromSnapshot(snapshot, token, playerId);
+    if (room) {
+      touchRoom(room);
+      return cb?.({ ok: true });
+    }
+    cb?.({ ok: false });
+  });
   socket.on('createRoom', ({ name, maxPlayers }, cb) => {
     const { room, token, player } = makeRoom(name, maxPlayers);
     rooms.set(room.id, room); socket.join(room.id); socket.data.roomId = room.id; socket.data.token = token;
@@ -316,17 +519,39 @@ io.on('connection', socket => {
     if (room.started) return cb?.({ ok: false, message: 'この部屋はすでに開始しています。再接続してください。' });
     if (room.players.length >= room.maxPlayers) return cb?.({ ok: false, message: 'この部屋は満員です。' });
     const id = room.players.length + 1; const token = makeToken();
-    const player = { id, token, name: (name || `プレイヤー${id}`).trim().slice(0, 16), color: PLAYER_COLORS[id - 1], light: PLAYER_LIGHT[id - 1], connected: true, resources: blankResources(0) };
+    const player = { id, token, name: (name || `プレイヤー${id}`).trim().slice(0, 16), color: PLAYER_COLORS[id - 1], light: PLAYER_LIGHT[id - 1], connected: true, resources: blankResources(0), devCards: blankDevCards(), playedKnights: 0 };
     room.players.push(player); socket.join(room.id); socket.data.roomId = room.id; socket.data.token = token;
     roomLog(room, `${player.name} が入室しました。`, 'join');
     cb?.({ ok: true, roomId: room.id, token, playerId: id, room: publicRoom(room) }); emitRoom(room);
   });
-  socket.on('reconnectPlayer', ({ roomId, token }, cb) => {
-    const room = rooms.get(String(roomId || '').trim().toUpperCase());
-    if (!room) return cb?.({ ok: false, message: '部屋が見つかりません。' });
-    const player = getPlayer(room, token); if (!player) return cb?.({ ok: false, message: '再接続情報が一致しません。' });
+  socket.on('reconnectPlayer', ({ roomId, token, playerId, snapshot }, cb) => {
+    const normalizedId = String(roomId || '').trim().toUpperCase();
+    let room = rooms.get(normalizedId);
+    if (!room && snapshot) room = restoreRoomFromSnapshot(snapshot, token, playerId);
+    if (!room) return cb?.({ ok: false, message: '部屋が見つかりません。保存データからも復元できませんでした。全員がページを更新せず、誰かの画面に最新状態が残っていれば再接続できる場合があります。' });
+    let player = getPlayer(room, token);
+    if (!player && playerId) {
+      const candidate = room.players.find(p => p.id === Number(playerId));
+      if (candidate && (!candidate.token || candidate.token === token)) {
+        candidate.token = token;
+        player = candidate;
+      }
+    }
+    if (!player) return cb?.({ ok: false, message: '再接続情報が一致しません。' });
+    if (player.id === 1 && !room.hostToken) room.hostToken = token;
     player.connected = true; socket.join(room.id); socket.data.roomId = room.id; socket.data.token = token;
     roomLog(room, `${player.name} が再接続しました。`, 'join');
+    cb?.({ ok: true, roomId: room.id, token, playerId: player.id, room: publicRoom(room) }); emitRoom(room);
+  });
+  socket.on('restoreRoom', ({ roomId, token, playerId, snapshot }, cb) => {
+    const normalizedId = String(roomId || '').trim().toUpperCase();
+    let room = rooms.get(normalizedId) || restoreRoomFromSnapshot(snapshot, token, playerId);
+    if (!room) return cb?.({ ok: false, message: '復元できる保存データがありません。' });
+    let player = getPlayer(room, token) || room.players.find(p => p.id === Number(playerId));
+    if (!player) return cb?.({ ok: false, message: 'プレイヤー情報が見つかりません。' });
+    if (!player.token) player.token = token;
+    if (player.id === 1 && !room.hostToken) room.hostToken = token;
+    player.connected = true; socket.join(room.id); socket.data.roomId = room.id; socket.data.token = token;
     cb?.({ ok: true, roomId: room.id, token, playerId: player.id, room: publicRoom(room) }); emitRoom(room);
   });
   socket.on('startGame', ({ roomId, token }, cb) => {
@@ -334,8 +559,8 @@ io.on('connection', socket => {
     if (room.hostToken !== token) return cb?.({ ok: false, message: '部屋主だけが開始できます。' });
     if (room.players.length < 2) return cb?.({ ok: false, message: '2人以上で開始できます。' });
     const board = createBoard(); Object.assign(room, board);
-    room.players.forEach(p => p.resources = blankResources(0));
-    room.started = true; room.gameOver = false; room.currentPlayerIndex = 0; room.phase = 'setup'; room.setupOrder = createSetupOrder(room.players); room.setupIndex = 0; room.setupSubphase = 'settlement'; room.setupSettlementNode = null; room.dice = null; room.winnerIds = []; room.log = []; room.longestRoadOwnerId = null; room.longestRoadLength = 0; room.pendingTrade = null;
+    room.players.forEach(p => { p.resources = blankResources(0); p.devCards = blankDevCards(); p.playedKnights = 0; });
+    room.started = true; room.gameOver = false; room.currentPlayerIndex = 0; room.phase = 'setup'; room.setupOrder = createSetupOrder(room.players); room.setupIndex = 0; room.setupSubphase = 'settlement'; room.setupSettlementNode = null; room.dice = null; room.winnerIds = []; room.log = []; room.longestRoadOwnerId = null; room.longestRoadLength = 0; room.pendingTrade = null; room.devDeck = createDevDeck(); room.largestArmyOwnerId = null; room.largestArmySize = 0; room.devDeck = createDevDeck(); room.largestArmyOwnerId = null; room.largestArmySize = 0;
     roomLog(room, 'ゲーム開始！初期配置を2周行います。', 'start');
     cb?.({ ok: true }); emitRoom(room);
   });
@@ -423,13 +648,67 @@ io.on('connection', socket => {
     if (!canAfford(player, COSTS.road)) return cb?.({ ok: false, message: '資源不足：道には 木・土 が必要です。' });
     pay(player, COSTS.road); edge.owner = player.id; roomLog(room, `${player.name} が道を建設しました。`, 'build'); updateLongestRoad(room); checkWin(room); cb?.({ ok: true }); emitRoom(room);
   });
+
+  socket.on('buyDevelopmentCard', ({ roomId, token }, cb) => {
+    const room = rooms.get(roomId); const player = room && getPlayer(room, token); if (!room || !player) return cb?.({ ok: false, message: '部屋またはプレイヤーが見つかりません。' });
+    if (room.phase !== 'action') return cb?.({ ok: false, message: '発展カードは自分の行動中だけ購入できます。' });
+    if (currentPlayer(room)?.token !== token) return cb?.({ ok: false, message: 'あなたの番ではありません。' });
+    if (!room.devDeck || room.devDeck.length === 0) return cb?.({ ok: false, message: '発展カードの山札がありません。' });
+    if (!canAfford(player, COSTS.development)) return cb?.({ ok: false, message: '資源不足：発展カードには 麦・羊・石 が必要です。' });
+    pay(player, COSTS.development);
+    const card = room.devDeck.pop();
+    player.devCards = Object.assign(blankDevCards(), player.devCards || {});
+    player.devCards[card] += 1;
+    roomLog(room, `${player.name} が発展カードを購入しました。`, 'dev');
+    checkWin(room); cb?.({ ok: true, card, label: DEV_CARD_LABELS[card] }); emitRoom(room);
+  });
+  socket.on('playDevelopmentCard', ({ roomId, token, card, resource, resource2, edgeIds }, cb) => {
+    const room = rooms.get(roomId); const player = room && getPlayer(room, token); if (!room || !player) return cb?.({ ok: false, message: '部屋またはプレイヤーが見つかりません。' });
+    if (room.phase !== 'action') return cb?.({ ok: false, message: '発展カードは自分の行動中だけ使えます。' });
+    if (currentPlayer(room)?.token !== token) return cb?.({ ok: false, message: 'あなたの番ではありません。' });
+    player.devCards = Object.assign(blankDevCards(), player.devCards || {});
+    if (!DEV_CARD_LABELS[card] || (player.devCards[card] || 0) <= 0) return cb?.({ ok: false, message: 'その発展カードを持っていません。' });
+    if (card === 'victory') return cb?.({ ok: false, message: '勝利点カードは持っているだけで点になります。' });
+    if (card === 'knight') {
+      player.devCards.knight -= 1; player.playedKnights = Number(player.playedKnights || 0) + 1; updateLargestArmy(room);
+      room.phase = 'robber'; roomLog(room, `${player.name} が騎士カードを使いました。盗賊を移動してください。`, 'dev'); checkWin(room); cb?.({ ok: true }); emitRoom(room); return;
+    }
+    if (card === 'monopoly') {
+      if (!RESOURCES.includes(resource)) return cb?.({ ok: false, message: '独占する資源を選んでください。' });
+      let total = 0; room.players.forEach(p => { if (p.id !== player.id) { const n = p.resources[resource] || 0; p.resources[resource] = 0; total += n; } });
+      player.resources[resource] += total; player.devCards.monopoly -= 1;
+      roomLog(room, `${player.name} が独占カードで${RESOURCE_LABELS[resource]}を${total}枚集めました。`, 'dev'); cb?.({ ok: true }); emitRoom(room); return;
+    }
+    if (card === 'yearOfPlenty') {
+      if (!RESOURCES.includes(resource) || !RESOURCES.includes(resource2)) return cb?.({ ok: false, message: '受け取る資源を2つ選んでください。' });
+      player.resources[resource] += 1; player.resources[resource2] += 1; player.devCards.yearOfPlenty -= 1;
+      roomLog(room, `${player.name} が収穫カードで${RESOURCE_LABELS[resource]}と${RESOURCE_LABELS[resource2]}を得ました。`, 'dev'); cb?.({ ok: true }); emitRoom(room); return;
+    }
+    if (card === 'roadBuilding') {
+      const ids = Array.isArray(edgeIds) ? edgeIds.slice(0, 2) : [];
+      if (!ids.length) return cb?.({ ok: false, message: '道を置く辺を1〜2本選んでください。' });
+      let built = 0;
+      for (const edgeId of ids) {
+        const edge = room.edges.find(e => e.id === edgeId);
+        if (!edge || edge.owner) continue;
+        if (!edgeTouchesOwnedNetwork(room, player.id, edge)) continue;
+        edge.owner = player.id; built += 1;
+      }
+      if (built === 0) return cb?.({ ok: false, message: '置ける道がありません。' });
+      player.devCards.roadBuilding -= 1; updateLongestRoad(room);
+      roomLog(room, `${player.name} が道路建設カードで道を${built}本置きました。`, 'dev'); checkWin(room); cb?.({ ok: true }); emitRoom(room); return;
+    }
+  });
   socket.on('bankTrade', ({ roomId, token, give, receive }, cb) => {
     const room = rooms.get(roomId); const player = room && getPlayer(room, token); if (!room || !player) return cb?.({ ok: false, message: '部屋またはプレイヤーが見つかりません。' });
     if (room.phase !== 'action') return cb?.({ ok: false, message: '交換は自分の行動中だけできます。' });
     if (currentPlayer(room)?.token !== token) return cb?.({ ok: false, message: 'あなたの番ではありません。' });
     if (!RESOURCES.includes(give) || !RESOURCES.includes(receive) || give === receive) return cb?.({ ok: false, message: '交換内容が正しくありません。' });
-    if ((player.resources[give] || 0) < 4) return cb?.({ ok: false, message: `${RESOURCE_LABELS[give]}が4つ必要です。` });
-    player.resources[give] -= 4; player.resources[receive] += 1; roomLog(room, `${player.name} が銀行交換：${RESOURCE_LABELS[give]}4 → ${RESOURCE_LABELS[receive]}1`, 'trade'); cb?.({ ok: true }); emitRoom(room);
+    const rate = bestBankRate(room, player.id, give);
+    if ((player.resources[give] || 0) < rate) return cb?.({ ok: false, message: `${RESOURCE_LABELS[give]}が${rate}つ必要です。` });
+    player.resources[give] -= rate; player.resources[receive] += 1;
+    const portText = rate === 2 ? '専用港' : rate === 3 ? '3:1港' : '銀行';
+    roomLog(room, `${player.name} が${portText}交換：${RESOURCE_LABELS[give]}${rate} → ${RESOURCE_LABELS[receive]}1`, 'trade'); cb?.({ ok: true }); emitRoom(room);
   });
   socket.on('proposeTrade', ({ roomId, token, toPlayerId, give, receive }, cb) => {
     const room = rooms.get(roomId); const player = room && getPlayer(room, token); if (!room || !player) return cb?.({ ok: false, message: '部屋またはプレイヤーが見つかりません。' });
