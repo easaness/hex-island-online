@@ -181,7 +181,7 @@ function createBoard() {
   });
   const desert = tiles.find(t => t.resource === 'desert');
   const { nodes, edges } = createGraph(tiles);
-  const ports = createPorts(nodes);
+  const ports = createPorts(nodes, edges);
   return { tiles, nodes, edges, ports, robberTileId: desert ? desert.id : tiles[0].id };
 }
 function axialToPixel(q, r) {
@@ -232,10 +232,11 @@ function createGraph(tiles) {
   });
   return { nodes, edges };
 }
-function createPorts(nodes) {
+function createPorts(nodes, edges) {
   const portTypes = ['wood', 'brick', 'wheat', 'sheep', 'ore', 'any', 'any', 'any', 'any'];
+  const coastalIds = new Set(nodes.filter(n => n.adjacentTiles.length < 3).map(n => n.id));
   const coastal = nodes
-    .filter(n => n.adjacentTiles.length < 3)
+    .filter(n => coastalIds.has(n.id))
     .map(n => {
       const angle = Math.atan2(n.y, n.x);
       const distance = Math.hypot(n.x, n.y);
@@ -245,20 +246,68 @@ function createPorts(nodes) {
   if (!coastal.length) return [];
   const step = coastal.length / portTypes.length;
   const used = new Set();
+
+  function findPair(start) {
+    const candidates = edges
+      .filter(e => (e.n1 === start.id || e.n2 === start.id))
+      .map(e => nodes.find(n => n.id === (e.n1 === start.id ? e.n2 : e.n1)))
+      .filter(n => n && coastalIds.has(n.id) && !used.has(n.id));
+    if (!candidates.length) return [start.id];
+    candidates.sort((a, b) => {
+      const da = Math.hypot(a.x - start.x, a.y - start.y);
+      const db = Math.hypot(b.x - start.x, b.y - start.y);
+      return da - db;
+    });
+    return [start.id, candidates[0].id];
+  }
+
   return portTypes.map((type, index) => {
     let pickIndex = Math.round(index * step) % coastal.length;
-    while (used.has(coastal[pickIndex].node.id)) pickIndex = (pickIndex + 1) % coastal.length;
+    let guard = 0;
+    while (used.has(coastal[pickIndex].node.id) && guard < coastal.length) {
+      pickIndex = (pickIndex + 1) % coastal.length;
+      guard += 1;
+    }
     const chosen = coastal[pickIndex].node;
-    used.add(chosen.id);
-    const len = Math.hypot(chosen.x, chosen.y) || 1;
+    const nodeIds = findPair(chosen);
+    nodeIds.forEach(id => used.add(id));
+    const pairNodes = nodeIds.map(id => nodes.find(n => n.id === id)).filter(Boolean);
+    const mx = pairNodes.reduce((sum, n) => sum + n.x, 0) / pairNodes.length;
+    const my = pairNodes.reduce((sum, n) => sum + n.y, 0) / pairNodes.length;
+    const len = Math.hypot(mx, my) || 1;
     return {
       id: `p${index}`,
       type,
-      nodeIds: [chosen.id],
-      x: chosen.x + (chosen.x / len) * 58,
-      y: chosen.y + (chosen.y / len) * 58
+      nodeIds,
+      x: mx + (mx / len) * 36,
+      y: my + (my / len) * 36
     };
   });
+}
+function sanitizeResourceMap(map) {
+  const out = {};
+  RESOURCES.forEach(r => {
+    const value = Number(map && map[r]);
+    out[r] = Number.isFinite(value) && value > 0 ? Math.floor(value) : 0;
+  });
+  return out;
+}
+function resourceMapTotal(map) {
+  return RESOURCES.reduce((sum, r) => sum + (Number(map && map[r]) || 0), 0);
+}
+function hasResources(player, map) {
+  return RESOURCES.every(r => (player.resources[r] || 0) >= (Number(map && map[r]) || 0));
+}
+function moveResources(from, to, map) {
+  RESOURCES.forEach(r => {
+    const n = Number(map && map[r]) || 0;
+    from.resources[r] -= n;
+    to.resources[r] += n;
+  });
+}
+function resourceMapText(map) {
+  const parts = RESOURCES.filter(r => (Number(map && map[r]) || 0) > 0).map(r => `${RESOURCE_ICONS[r]}${RESOURCE_LABELS[r]}${map[r]}`);
+  return parts.length ? parts.join('・') : 'なし';
 }
 function playerPorts(room, playerId) {
   return (room.ports || []).filter(port => port.nodeIds.some(nodeId => room.nodes.find(n => n.id === nodeId && n.owner === playerId)));
@@ -373,6 +422,7 @@ function publicRoom(room) {
     edges: room.edges,
     ports: room.ports || [],
     robberTileId: room.robberTileId,
+    pendingDiscards: room.pendingDiscards || {},
     dice: room.dice,
     winnerIds: room.winnerIds,
     log: room.log.slice(-32),
@@ -446,22 +496,33 @@ function distributeResources(room, sum) {
   });
   return gains;
 }
-function discardForSeven(room) {
+function setupDiscardForSeven(room) {
+  room.pendingDiscards = {};
   room.players.forEach(p => {
     const total = resourceTotal(p);
-    if (total <= 7) return;
-    let discard = Math.floor(total / 2);
-    const lost = blankResources(0);
-    while (discard > 0) {
-      const available = RESOURCES.filter(r => p.resources[r] > 0);
-      if (!available.length) break;
-      const r = available[Math.floor(Math.random() * available.length)];
-      p.resources[r] -= 1;
-      lost[r] += 1;
-      discard -= 1;
-    }
-    roomLog(room, `${p.name} は7枚超過のため ${resourceText(lost)} を捨てました。`, 'robber');
+    if (total > 7) room.pendingDiscards[p.id] = { need: Math.floor(total / 2), done: false };
   });
+  return Object.keys(room.pendingDiscards).length;
+}
+function allDiscardsDone(room) {
+  const pending = room.pendingDiscards || {};
+  return Object.keys(pending).every(id => pending[id].done);
+}
+function applyDiscard(room, player, discard) {
+  const pending = room.pendingDiscards && room.pendingDiscards[player.id];
+  if (!pending || pending.done) return { ok: false, message: 'あなたは破棄対象ではありません。' };
+  const clean = blankResources(0);
+  let total = 0;
+  for (const r of RESOURCES) {
+    const n = Math.max(0, Math.floor(Number(discard && discard[r]) || 0));
+    if (n > player.resources[r]) return { ok: false, message: `${RESOURCE_LABELS[r]}を持っている数より多く捨てようとしています。` };
+    clean[r] = n; total += n;
+  }
+  if (total !== pending.need) return { ok: false, message: `${pending.need}枚ちょうど選んでください。現在 ${total}枚です。` };
+  for (const r of RESOURCES) player.resources[r] -= clean[r];
+  pending.done = true;
+  roomLog(room, `${player.name} は7枚超過のため ${resourceText(clean)} を捨てました。`, 'robber');
+  return { ok: true };
 }
 function stealFromRobberTile(room, player, tileId) {
   const victimIds = new Set(room.nodes.filter(n => n.owner && n.owner !== player.id && n.adjacentTiles.includes(tileId)).map(n => n.owner));
@@ -480,7 +541,7 @@ function makeRoom(name, maxPlayers) {
   const board = createBoard();
   const player = { id: 1, token, name: (name || 'プレイヤー1').trim().slice(0, 16), color: PLAYER_COLORS[0], light: PLAYER_LIGHT[0], connected: true, resources: blankResources(0), devCards: blankDevCards(), playedKnights: 0 };
   return {
-    room: { id, maxPlayers: Math.max(2, Math.min(4, Number(maxPlayers) || 2)), hostToken: token, players: [player], started: false, gameOver: false, currentPlayerIndex: 0, phase: 'waiting', setupOrder: [], setupIndex: 0, setupSubphase: 'settlement', setupSettlementNode: null, ...board, dice: null, winnerIds: [], log: [], longestRoadOwnerId: null, longestRoadLength: 0, pendingTrade: null, devDeck: createDevDeck(), largestArmyOwnerId: null, largestArmySize: 0 },
+    room: { id, maxPlayers: Math.max(2, Math.min(4, Number(maxPlayers) || 2)), hostToken: token, players: [player], started: false, gameOver: false, currentPlayerIndex: 0, phase: 'waiting', setupOrder: [], setupIndex: 0, setupSubphase: 'settlement', setupSettlementNode: null, ...board, dice: null, winnerIds: [], log: [], longestRoadOwnerId: null, longestRoadLength: 0, pendingTrade: null, devDeck: createDevDeck(), largestArmyOwnerId: null, largestArmySize: 0, pendingDiscards: {} },
     token,
     player
   };
@@ -560,7 +621,7 @@ io.on('connection', socket => {
     if (room.players.length < 2) return cb?.({ ok: false, message: '2人以上で開始できます。' });
     const board = createBoard(); Object.assign(room, board);
     room.players.forEach(p => { p.resources = blankResources(0); p.devCards = blankDevCards(); p.playedKnights = 0; });
-    room.started = true; room.gameOver = false; room.currentPlayerIndex = 0; room.phase = 'setup'; room.setupOrder = createSetupOrder(room.players); room.setupIndex = 0; room.setupSubphase = 'settlement'; room.setupSettlementNode = null; room.dice = null; room.winnerIds = []; room.log = []; room.longestRoadOwnerId = null; room.longestRoadLength = 0; room.pendingTrade = null; room.devDeck = createDevDeck(); room.largestArmyOwnerId = null; room.largestArmySize = 0; room.devDeck = createDevDeck(); room.largestArmyOwnerId = null; room.largestArmySize = 0;
+    room.started = true; room.gameOver = false; room.currentPlayerIndex = 0; room.phase = 'setup'; room.setupOrder = createSetupOrder(room.players); room.setupIndex = 0; room.setupSubphase = 'settlement'; room.setupSettlementNode = null; room.dice = null; room.winnerIds = []; room.log = []; room.longestRoadOwnerId = null; room.longestRoadLength = 0; room.pendingTrade = null; room.devDeck = createDevDeck(); room.largestArmyOwnerId = null; room.largestArmySize = 0; room.pendingDiscards = {};
     roomLog(room, 'ゲーム開始！初期配置を2周行います。', 'start');
     cb?.({ ok: true }); emitRoom(room);
   });
@@ -603,8 +664,16 @@ io.on('connection', socket => {
     if (currentPlayer(room)?.token !== token) return cb?.({ ok: false, message: 'あなたの番ではありません。' });
     const d1 = Math.floor(Math.random() * 6) + 1; const d2 = Math.floor(Math.random() * 6) + 1; const sum = d1 + d2; room.dice = { d1, d2, sum };
     room.pendingTrade = null;
-    if (sum === 7) { discardForSeven(room); room.phase = 'robber'; roomLog(room, `${player.name} が 7 を出しました。盗賊を移動してください。`, 'robber'); }
+    if (sum === 7) { const count = setupDiscardForSeven(room); room.phase = count ? 'discard' : 'robber'; roomLog(room, `${player.name} が 7 を出しました。${count ? '7枚を超えるプレイヤーは捨てる資源を選んでください。' : '盗賊を移動してください。'}`, 'robber'); }
     else { const gains = distributeResources(room, sum); room.phase = 'action'; roomLog(room, `${player.name} が ${d1}+${d2}=${sum} を出しました。${gains.length ? gains.join('、') : '資源獲得なし。'}`, 'gain'); }
+    cb?.({ ok: true }); emitRoom(room);
+  });
+  socket.on('submitDiscard', ({ roomId, token, discard }, cb) => {
+    const room = rooms.get(roomId); const player = room && getPlayer(room, token); if (!room || !player) return cb?.({ ok: false, message: '部屋またはプレイヤーが見つかりません。' });
+    if (room.phase !== 'discard') return cb?.({ ok: false, message: '今は資源を捨てるタイミングではありません。' });
+    const result = applyDiscard(room, player, discard);
+    if (!result.ok) return cb?.(result);
+    if (allDiscardsDone(room)) { room.phase = 'robber'; roomLog(room, '破棄が完了しました。現在のプレイヤーは盗賊を移動してください。', 'robber'); }
     cb?.({ ok: true }); emitRoom(room);
   });
   socket.on('moveRobber', ({ roomId, token, tileId }, cb) => {
@@ -710,15 +779,23 @@ io.on('connection', socket => {
     const portText = rate === 2 ? '専用港' : rate === 3 ? '3:1港' : '銀行';
     roomLog(room, `${player.name} が${portText}交換：${RESOURCE_LABELS[give]}${rate} → ${RESOURCE_LABELS[receive]}1`, 'trade'); cb?.({ ok: true }); emitRoom(room);
   });
-  socket.on('proposeTrade', ({ roomId, token, toPlayerId, give, receive }, cb) => {
+  socket.on('proposeTrade', ({ roomId, token, toPlayerId, give, receive, offer, request }, cb) => {
     const room = rooms.get(roomId); const player = room && getPlayer(room, token); if (!room || !player) return cb?.({ ok: false, message: '部屋またはプレイヤーが見つかりません。' });
     if (room.phase !== 'action' || currentPlayer(room)?.token !== token) return cb?.({ ok: false, message: '交渉は自分の行動中だけできます。' });
     const target = room.players.find(p => p.id === Number(toPlayerId));
     if (!target || target.id === player.id) return cb?.({ ok: false, message: '交渉相手を選んでください。' });
-    if (!RESOURCES.includes(give) || !RESOURCES.includes(receive) || give === receive) return cb?.({ ok: false, message: '交換内容が正しくありません。' });
-    if (player.resources[give] < 1) return cb?.({ ok: false, message: `${RESOURCE_LABELS[give]}を持っていません。` });
-    room.pendingTrade = { fromPlayerId: player.id, toPlayerId: target.id, give, receive, createdAt: Date.now() };
-    roomLog(room, `${player.name} が ${target.name} に交渉：${RESOURCE_LABELS[give]}1 → ${RESOURCE_LABELS[receive]}1`, 'trade');
+
+    let offerMap = sanitizeResourceMap(offer);
+    let requestMap = sanitizeResourceMap(request);
+    // 古いUI/通信との互換性。未指定なら従来の1:1扱い。
+    if (resourceMapTotal(offerMap) === 0 && RESOURCES.includes(give)) offerMap[give] = 1;
+    if (resourceMapTotal(requestMap) === 0 && RESOURCES.includes(receive)) requestMap[receive] = 1;
+
+    if (resourceMapTotal(offerMap) === 0 || resourceMapTotal(requestMap) === 0) return cb?.({ ok: false, message: '渡す資源と欲しい資源を1枚以上指定してください。' });
+    if (!hasResources(player, offerMap)) return cb?.({ ok: false, message: '提示する資源が不足しています。' });
+
+    room.pendingTrade = { fromPlayerId: player.id, toPlayerId: target.id, offer: offerMap, request: requestMap, createdAt: Date.now() };
+    roomLog(room, `${player.name} が ${target.name} に交渉：渡す ${resourceMapText(offerMap)} / ほしい ${resourceMapText(requestMap)}`, 'trade');
     cb?.({ ok: true }); emitRoom(room);
   });
   socket.on('acceptTrade', ({ roomId, token }, cb) => {
@@ -726,10 +803,12 @@ io.on('connection', socket => {
     const trade = room.pendingTrade;
     if (trade.toPlayerId !== player.id) return cb?.({ ok: false, message: 'あなた宛ての交渉ではありません。' });
     const from = room.players.find(p => p.id === trade.fromPlayerId);
-    if (!from || from.resources[trade.give] < 1 || player.resources[trade.receive] < 1) { room.pendingTrade = null; return cb?.({ ok: false, message: 'どちらかの資源が不足しています。' }); }
-    from.resources[trade.give] -= 1; player.resources[trade.give] += 1;
-    player.resources[trade.receive] -= 1; from.resources[trade.receive] += 1;
-    roomLog(room, `${player.name} が交渉を承諾しました。`, 'trade');
+    const offerMap = trade.offer || sanitizeResourceMap({ [trade.give]: 1 });
+    const requestMap = trade.request || sanitizeResourceMap({ [trade.receive]: 1 });
+    if (!from || !hasResources(from, offerMap) || !hasResources(player, requestMap)) { room.pendingTrade = null; return cb?.({ ok: false, message: 'どちらかの資源が不足しています。交渉を取り消しました。' }); }
+    moveResources(from, player, offerMap);
+    moveResources(player, from, requestMap);
+    roomLog(room, `${player.name} が交渉を承諾：${from.name} → ${resourceMapText(offerMap)} / ${player.name} → ${resourceMapText(requestMap)}`, 'trade');
     room.pendingTrade = null; cb?.({ ok: true }); emitRoom(room);
   });
   socket.on('cancelTrade', ({ roomId, token }, cb) => {
